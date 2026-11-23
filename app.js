@@ -36,7 +36,6 @@
   // Without this token, a slow script can finish later and steal the page back.
   let bankSelectionVersion = 0;
   let methodFamilyFilter = "all";
-  let pendingStorageWarning = "";
   let lastStorageWarning = "";
   let storageWriteFailed = false;
   const unsavedNoteIds = new Set();
@@ -774,7 +773,6 @@
   function showStorageWarning(message) {
     if (lastStorageWarning === message) return;
     lastStorageWarning = message;
-    pendingStorageWarning = "";
     if (el.storageWarning) {
       el.storageWarning.textContent = message;
       el.storageWarning.hidden = false;
@@ -2851,7 +2849,6 @@
 
   applyTheme(document.documentElement.dataset.theme, false);
   configureAccessibility();
-  if (pendingStorageWarning) showStorageWarning(pendingStorageWarning);
 
   if (window.QuizAI) {
     window.QuizAI.init({
