@@ -7,6 +7,8 @@
   const BANK_META_KEY = "quizhub_bank_meta_v1";
   const NOTE_MAX_LEN = 10000;
   const RESPONSE_MAX_LEN = 20000;
+  const BANK_LOAD_TIMEOUT_MS = 20000;
+  const PUBLIC_SITE_URL = "https://hokkaidoooo.github.io/quiz-hub/";
   const EXPLANATION_COLLAPSE_LENGTH = 300;
   const EMPTY_META = { total: 0, subjects: [], chapters: {} };
 
@@ -37,15 +39,17 @@
   let bankSelectionVersion = 0;
   let methodFamilyFilter = "all";
   let lastStorageWarning = "";
-  let storageWriteFailed = false;
+  const stateStores = new Map();
+  let activeStateStore = null;
+  let bankFilter = "all";
+  let failedBankId = "";
+  let restoringRoute = true;
+  let routeVersion = 0;
   const unsavedNoteIds = new Set();
   const tableResizeObservers = new WeakMap();
 
   /** @type {{done: Record<string, {choice:string, response?:string, review?:string, correct:boolean|null, ts:number}>, wrong: string[], last: {mode:string, subject?:string, chapterKey?:string, index:number, questionId?:string}|null, notes: Record<string, {text:string, updatedAt:number}>}} */
-  let state = { done: {}, wrong: [], last: null, notes: {} };
-  /** @type {{id: string, text: string}|null} */
-  let pendingNote = null;
-  let noteSaveTimer = null;
+  let state = { done: {}, wrong: [], last: null, notes: {}, drafts: {} };
   let noteEditorOpen = false;
   let notePreviewMode = false;
 
@@ -121,6 +125,16 @@
     btnJump: $("#btn-jump"),
     toast: $("#toast"),
     storageWarning: $("#storage-warning"),
+    btnBackup: $("#btn-backup"),
+    btnRetryLoad: $("#btn-retry-load"),
+    loadError: $("#bank-load-error"),
+    bankFilters: $("#bank-filters"),
+    btnResumeBank: $("#btn-resume-bank"),
+    btnCopyLink: $("#btn-copy-link"),
+    btnReport: $("#btn-report"),
+    reportDialog: $("#report-dialog"),
+    reportPreview: $("#report-preview"),
+    reportLink: $("#report-link"),
   };
 
   /** @type {{list: typeof allQuestions, index: number, mode: string, subject?: string, chapterKey?: string, attempts: Record<string, {choice:string, correct:boolean|null, ts:number}>, drafts: Record<string, string>}} */
@@ -131,7 +145,7 @@
   }
 
   function emptyState() {
-    return { done: {}, wrong: [], last: null, notes: {} };
+    return { done: {}, wrong: [], last: null, notes: {}, drafts: {} };
   }
 
   function isSubjectiveQuestion(q) {
@@ -151,9 +165,14 @@
 
     const loader = new Promise((resolve, reject) => {
       const script = document.createElement("script");
+      const timer = setTimeout(() => {
+        script.remove();
+        reject(new Error(`「${bank.name}」载入超时，请检查网络后重试。`));
+      }, BANK_LOAD_TIMEOUT_MS);
       script.src = bank.data;
       script.async = false;
       script.addEventListener("load", () => {
+        clearTimeout(timer);
         const loaded = window.QUESTIONS_DATA;
         // 各题库数据文件都写同一个全局变量，取走后立刻清掉，避免互相串味。
         window.QUESTIONS_DATA = undefined;
@@ -169,12 +188,13 @@
         resolve(loaded);
       });
       script.addEventListener("error", () => {
+        clearTimeout(timer);
         script.remove();
-        reject(new Error(`读不到题库文件：${bank.data}`));
+        reject(new Error(`「${bank.name}」载入失败，请检查网络后重试。`));
       });
       document.head.appendChild(script);
     });
-    loader.catch(() => {}).then(() => bankLoaders.delete(bank.id));
+    loader.then(() => bankLoaders.delete(bank.id), () => bankLoaders.delete(bank.id));
     bankLoaders.set(bank.id, loader);
     return loader;
   }
@@ -220,9 +240,11 @@
     const loaded = bankDataCache.get(bank.id);
     const total = loaded ? loaded.meta.total : bank.total || cached[bank.id] || 0;
     const stored = readBankState(bank);
-    const raw = loaded
-      ? normalizeStoredState(stored, new Map(loaded.questions.map((q) => [String(q.id), q])), bank.preserveRetiredRecords === true)
-      : stored;
+    let raw = stored;
+    if (loaded && stored) {
+      try { raw = normalizeStoredState(stored, new Map(loaded.questions.map((q) => [String(q.id), q])), bank.preserveRetiredRecords === true); }
+      catch (error) { return { total, error: error.message }; }
+    }
     const done = raw && raw.done && typeof raw.done === "object" ? Object.keys(raw.done).length : 0;
     const wrong = raw && Array.isArray(raw.wrong) ? raw.wrong.length : 0;
     const notes = raw && raw.notes && typeof raw.notes === "object" ? Object.keys(raw.notes).length : 0;
@@ -284,6 +306,8 @@
       el.banksNote.textContent = message || `共 ${banks.length} 个题库 · 进度分开保存`;
     }
     banks.forEach((bank, index) => {
+      const category = /408|relax/.test(bank.id) ? "computer" : "math";
+      if (bankFilter !== "all" && category !== bankFilter) return;
       const external = isExternalBank(bank);
       const overview = bankOverview(bank);
       // 独立页面题库用 <a>，这样中键、右键新标签页打开都照常可用。
@@ -325,7 +349,7 @@
           <span>题量 <strong>${bank.total || "—"}</strong></span>
           <span class="bank-open-hint">进度在该页面单独保存</span>
         </div>`
-            : `<div class="bank-stats">
+            : overview.error ? `<div class="bank-stats bank-record-error" role="status">记录格式异常，请先备份与恢复</div>` : `<div class="bank-stats">
           <span>题量 <strong>${overview.total || "—"}</strong></span>
           <span>已做 <strong>${overview.done}</strong></span>
           <span>错题 <strong>${overview.wrong}</strong></span>
@@ -337,6 +361,7 @@
       if (!external) card.addEventListener("click", () => selectBank(bank.id));
       el.bankGrid.appendChild(card);
     });
+    updateResumeBank();
   }
 
   function showBankChooser(message) {
@@ -385,7 +410,7 @@
     const selectionVersion = ++bankSelectionVersion;
     const bank = bankById(bankId);
     if (!bank) {
-      showBankChooser("题库不存在，请检查 banks.js");
+      showBankChooser("这个题库已不可用，请重新选择。");
       return Promise.resolve(false);
     }
     // 独立页面题库不由本引擎驱动，卡片本身就是链接，不该走到这里。
@@ -395,15 +420,20 @@
       return Promise.resolve(true);
     }
     if (el.banksNote) el.banksNote.textContent = `正在载入「${bank.name}」…`;
+    el.loadError.hidden = true;
+    el.bankGrid.setAttribute("aria-busy", "true");
     return loadBankData(bank)
       .then((loaded) => {
         if (selectionVersion !== bankSelectionVersion) return false;
+        el.bankGrid.setAttribute("aria-busy", "false");
         runLegacyImport(bank);
         activateBank(bank, loaded);
         return true;
       })
       .catch((error) => {
         if (selectionVersion !== bankSelectionVersion) return false;
+        failedBankId = bank.id;
+        el.bankGrid.setAttribute("aria-busy", "false");
         const detail = error && error.message ? error.message : "题库加载失败";
         if (options && options.silent) {
           showBankChooser(detail);
@@ -411,6 +441,7 @@
           showBankChooser(detail);
           toast(detail);
         }
+        el.loadError.hidden = false;
         return false;
       });
   }
@@ -418,13 +449,24 @@
   function activateBank(bank, loaded) {
     const nextStorageKey = bank.storageKey || `quizhub_${bank.id}_v1`;
     const nextQuestionIndex = new Map(loaded.questions.map((q) => [String(q.id), q]));
-    const nextState = loadState(nextStorageKey, nextQuestionIndex, bank.preserveRetiredRecords === true);
+    let nextStore = stateStores.get(bank.id);
+    if (!nextStore) {
+      nextStore = window.QuizStorage.open(nextStorageKey, {
+        empty: emptyState,
+        normalize: (value) => normalizeStoredState(value, nextQuestionIndex, bank.preserveRetiredRecords === true),
+        overwritePaths: ["last"],
+        setPaths: ["wrong", "retiredRecords.wrong"],
+        atomicPaths: ["done.*", "notes.*", "drafts.*", "retiredRecords.done.*", "retiredRecords.notes.*", "retiredRecords.drafts.*"],
+      });
+      stateStores.set(bank.id, nextStore);
+      nextStore.subscribe((event) => handleStateEvent(nextStore, event));
+    } else if (!nextStore.pending) {
+      nextStore.refresh();
+    }
     flushNoteSave();
     noteEditorOpen = false;
     notePreviewMode = false;
-    pendingNote = null;
     unsavedNoteIds.clear();
-    storageWriteFailed = false;
     lastStorageWarning = "";
     if (el.storageWarning) el.storageWarning.hidden = true;
 
@@ -447,14 +489,14 @@
     STORAGE_KEY = nextStorageKey;
     methodFamilyFilter = "all";
     session = { list: [], index: 0, mode: "home", attempts: {}, drafts: {} };
-    state = nextState;
+    activeStateStore = nextStore;
+    state = nextStore.value;
     document.body.dataset.bank = bank.id;
     try {
       localStorage.setItem(LAST_BANK_KEY, bank.id);
     } catch (_) {}
     if (window.QuizAI) window.QuizAI.setBank(bank, meta);
     updateTopbar();
-    saveState();
     renderHome();
   }
 
@@ -609,9 +651,9 @@
     const archived = parsed.retiredRecords && typeof parsed.retiredRecords === "object"
       ? parsed.retiredRecords
       : {};
-    const active = { done: Object.create(null), wrong: [], notes: Object.create(null), last: null };
-    const retiredRecords = { done: Object.create(null), wrong: [], notes: Object.create(null) };
-    for (const collection of ["done", "notes"]) {
+    const active = { done: Object.create(null), wrong: [], notes: Object.create(null), drafts: Object.create(null), last: null };
+    const retiredRecords = { ...archived, done: Object.create(null), wrong: [], notes: Object.create(null), drafts: Object.create(null) };
+    for (const collection of ["done", "notes", "drafts"]) {
       const records = new Map([...stateRecordEntries(archived[collection]), ...stateRecordEntries(parsed[collection])]);
       for (const [id, value] of records) {
         const target = questionIndex.has(id) ? active : retiredRecords;
@@ -634,7 +676,7 @@
 
   function normalizeStoredState(parsed, questionIndex = questionsById,
     preserveRetiredRecords = activeBank && activeBank.preserveRetiredRecords === true) {
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return emptyState();
+    window.QuizRecordSchema.validate(parsed, "hub");
     const partitioned = preserveRetiredRecords ? partitionStoredRecords(parsed, questionIndex) : null;
     const current = partitioned ? partitioned.active : parsed;
     const done = {};
@@ -644,11 +686,12 @@
         if (!q || !result || typeof result !== "object") continue;
         if (isSubjectiveQuestion(q)) {
           const choice = String(result.choice || "").toUpperCase();
-          if (choice !== "REVIEWED") continue;
+          if (choice !== "REVIEWED") throw new TypeError(`题目 ${id} 的作答类型与题目不一致，已保留原记录。`);
           const review = ["pending", "mastered", "revisit"].includes(result.review)
             ? result.review
             : "pending";
           done[id] = {
+            ...result,
             choice: "REVIEWED",
             response: String(result.response || "").slice(0, RESPONSE_MAX_LEN),
             review,
@@ -662,8 +705,9 @@
           : String(result.choice || "")
         ).toUpperCase();
         const expectedLength = getChoicePartCount(q);
-        if (!/^[A-E]+$/.test(choice) || choice.length !== expectedLength) continue;
+        if (!/^[A-E]+$/.test(choice) || choice.length !== expectedLength) throw new TypeError(`题目 ${id} 的选择作答格式不匹配，已保留原记录。`);
         done[id] = {
+          ...result,
           choice,
           // `correct` is derived from the current dataset so answer fixes do
           // not leave historical statistics permanently stale.
@@ -700,6 +744,7 @@
         const text = String(note.text || "").slice(0, NOTE_MAX_LEN);
         if (!text.trim()) continue;
         notes[id] = {
+          ...note,
           text,
           updatedAt: Number.isFinite(note.updatedAt) ? note.updatedAt : 0,
         };
@@ -707,67 +752,63 @@
     }
 
     const validModes = new Set(["wrong", "subject", "chapter", "notes"]);
+    const drafts = {};
+    for (const [id, text] of stateRecordEntries(current.drafts)) {
+      if (!questionIndex.has(id) || typeof text !== "string" || !text) continue;
+      drafts[id] = text.slice(0, isSubjectiveQuestion(questionIndex.get(id)) ? RESPONSE_MAX_LEN : 10);
+    }
     const last =
       current.last && typeof current.last === "object" && validModes.has(current.last.mode)
         && !referencesMissingQuestion(current.last, questionIndex)
         ? {
+            ...current.last,
             mode: current.last.mode,
-            subject: typeof current.last.subject === "string" ? current.last.subject : undefined,
-            chapterKey:
-              typeof current.last.chapterKey === "string" ? current.last.chapterKey : undefined,
             index:
               Number.isInteger(current.last.index) && current.last.index >= 0 ? current.last.index : 0,
-            questionId:
-              current.last.questionId != null
-                ? String(current.last.questionId)
-                : undefined,
+            ...(current.last.questionId != null ? { questionId: String(current.last.questionId) } : {}),
           }
         : null;
-    const normalized = { done, wrong: [...wrongSet], last, notes };
+    const normalized = { ...parsed, done, wrong: [...wrongSet], last, notes, drafts };
     if (partitioned) normalized.retiredRecords = partitioned.retiredRecords;
     return normalized;
   }
 
-  function loadState(storageKey = STORAGE_KEY, questionIndex = questionsById,
-    preserveRetiredRecords = activeBank && activeBank.preserveRetiredRecords === true) {
-    try {
-      const raw = localStorage.getItem(storageKey);
-      if (raw === null) return emptyState();
-      const parsed = JSON.parse(raw);
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-        throw new TypeError("本地进度必须为对象");
-      }
-      return normalizeStoredState(parsed, questionIndex, preserveRetiredRecords);
-    } catch (error) {
-      throw new Error("本地进度无法读取，已停止载入以保留原记录", { cause: error });
+  function handleStateEvent(store, event) {
+    if (event.type === "error") {
+      if (store === activeStateStore) showStorageWarning(event.error.message);
+      return;
+    }
+    if (store !== activeStateStore) return;
+    state = store.value;
+    if (event.type === "saved" && !store.pending) {
+      lastStorageWarning = "";
+      el.storageWarning.hidden = true;
+      unsavedNoteIds.clear();
+      updateNoteStatus();
+    }
+    if (event.type !== "external") return;
+    if (document.body.dataset.view === "home") renderHome();
+    else if (document.body.dataset.view === "banks") renderBankChooser();
+    else if (document.body.dataset.view === "quiz" && !document.activeElement?.matches("textarea")) {
+      renderQuestion(null, { rememberPosition: false });
     }
   }
 
-  // Every mutation starts from the latest persisted snapshot. This prevents a
-  // stale second tab from overwriting answers or notes merely by navigating.
   function saveState(mutator) {
-    if (!STORAGE_KEY) return false;
-    let next = state;
-    if (!storageWriteFailed) {
-      try {
-        next = loadState();
-      } catch (error) {
-        showStorageWarning(error.message);
-        return false;
-      }
-    }
-    if (typeof mutator === "function") mutator(next);
-    state = next;
+    const store = activeStateStore;
+    if (!store) return Promise.resolve(false);
+    let saving;
     try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-      storageWriteFailed = false;
-      unsavedNoteIds.clear();
-      return true;
-    } catch (_) {
-      storageWriteFailed = true;
-      showStorageWarning("浏览器无法保存进度，本次操作仅在当前页面有效");
-      return false;
+      saving = typeof mutator === "function" ? store.update(mutator) : store.flush();
+      state = store.value;
+    } catch (error) {
+      showStorageWarning(error.message);
+      return Promise.resolve(false);
     }
+    return saving.then(() => true, (error) => {
+      if (store === activeStateStore) showStorageWarning(`${error.message} 本页未保存的操作仍保留，请重试保存或导出备份。`);
+      return false;
+    });
   }
 
   function showStorageWarning(message) {
@@ -775,6 +816,12 @@
     lastStorageWarning = message;
     if (el.storageWarning) {
       el.storageWarning.textContent = message;
+      const retry = document.createElement("button");
+      retry.type = "button";
+      retry.className = "btn btn-ghost";
+      retry.textContent = "重试保存";
+      retry.addEventListener("click", () => saveState().then((saved) => { if (saved) toast("记录已保存"); }));
+      el.storageWarning.appendChild(retry);
       el.storageWarning.hidden = false;
       el.storageWarning.setAttribute("aria-live", "assertive");
     } else {
@@ -848,6 +895,130 @@
       focusTarget.focus({ preventScroll: true });
     }
     requestAnimationFrame(() => window.scrollTo({ top: 0, left: 0, behavior: "auto" }));
+    if (name !== "quiz") syncRoute();
+  }
+
+  function currentRoute() {
+    const view = document.body.dataset.view || "banks";
+    const route = { view };
+    if (view === "banks" || !activeBank) return route;
+    route.bank = activeBank.id;
+    if (view === "chapters") {
+      if (el.viewChapters.dataset.mode === "wrong") route.mode = "wrong";
+      else route.subject = el.viewChapters.dataset.subject;
+    }
+    if (view === "quiz") {
+      route.mode = session.mode;
+      route.subject = session.subject;
+      route.chapter = session.chapterKey;
+      route.question = currentQ() ? String(currentQ().id) : "";
+    }
+    return route;
+  }
+
+  function routeHash(route) {
+    return `#${new URLSearchParams(Object.entries(route).filter(([, value]) => value != null && value !== "")).toString()}`;
+  }
+
+  function syncRoute(replace = false) {
+    if (restoringRoute) return;
+    const hash = routeHash(currentRoute());
+    if (location.hash === hash) return;
+    history[replace ? "replaceState" : "pushState"]({ quizhub: true }, "", hash);
+  }
+
+  async function restoreRoute() {
+    const version = ++routeVersion;
+    restoringRoute = true;
+    flushNoteSave();
+    const params = new URLSearchParams(location.hash.slice(1));
+    const view = params.get("view") || "banks";
+    try {
+      if (view === "banks") {
+        showBankChooser();
+        return;
+      }
+      const bank = bankById(params.get("bank"));
+      if (!bank || isExternalBank(bank)) throw new Error("链接中的题库不可用，请重新选择。");
+      if (!await selectBank(bank.id, { silent: true })) return;
+      if (version !== routeVersion) return;
+      if (view === "home") return;
+      if (view === "methods") {
+        openMethodCenter();
+        return;
+      }
+      if (view === "chapters") {
+        if (params.get("mode") === "wrong") openWrongBook();
+        else if (questionsBySubject.has(params.get("subject"))) openChapters(params.get("subject"));
+        else throw new Error("链接中的分类已不可用。");
+        return;
+      }
+      if (view !== "quiz") throw new Error("这个页面链接无法识别。");
+      const q = questionsById.get(params.get("question"));
+      if (!q) throw new Error("链接中的题目已不在当前题库。");
+      let mode = params.get("mode") || "subject";
+      let subject = params.get("subject") || (["subject", "chapter"].includes(mode) ? q.subject : undefined);
+      const chapterKey = params.get("chapter");
+      let list;
+      if (mode === "wrong") list = wrongQuestions(params.get("subject") || undefined);
+      else if (mode === "notes") list = notedQuestions();
+      else if (mode === "chapter") list = chapterQuestions(subject, chapterKey);
+      else if (mode === "subject") list = subjectQuestions(subject);
+      else throw new Error("链接中的练习模式无法识别。");
+      let index = list.findIndex((item) => String(item.id) === String(q.id));
+      if (index < 0 && ["wrong", "notes"].includes(mode)) {
+        mode = "subject";
+        subject = q.subject;
+        list = subjectQuestions(subject);
+        index = list.findIndex((item) => String(item.id) === String(q.id));
+        toast("这道题已不在该复习列表，已按题号打开。");
+      }
+      if (index < 0) throw new Error("题号与链接中的分类不一致。");
+      startSession(list, { mode, subject, chapterKey, index });
+    } catch (error) {
+      showBankChooser(error.message);
+      showStorageWarning(error.message);
+    } finally {
+      if (version === routeVersion) {
+        restoringRoute = false;
+        syncRoute(true);
+      }
+    }
+  }
+
+  function updateResumeBank() {
+    let lastId;
+    try { lastId = localStorage.getItem(LAST_BANK_KEY); }
+    catch (error) { showStorageWarning(`无法读取上次题库：${error.message}`); }
+    const bank = bankById(lastId);
+    el.btnResumeBank.hidden = !bank || isExternalBank(bank);
+    if (bank && !isExternalBank(bank)) {
+      el.btnResumeBank.textContent = `继续上次 · ${bank.name}`;
+      el.btnResumeBank.dataset.bank = bank.id;
+    }
+  }
+
+  async function copyQuestionLink() {
+    const url = new URL(routeHash(currentRoute()), PUBLIC_SITE_URL).href;
+    try {
+      await navigator.clipboard.writeText(url);
+      toast("题目链接已复制");
+    } catch (error) {
+      const dialog = $("#share-dialog");
+      $("#share-url").value = url;
+      dialog.showModal();
+      $("#share-url").select();
+    }
+  }
+
+  function reportQuestion() {
+    const q = currentQ();
+    if (!q) return;
+    const url = new URL(routeHash(currentRoute()), PUBLIC_SITE_URL).href;
+    const body = `题库：${activeBank.name}\n题目 ID：${q.id}\n题目链接：${url}\n\n问题描述：\n\n建议或依据：`;
+    el.reportPreview.value = body;
+    el.reportLink.href = `https://github.com/Hokkaidoooo/quiz-hub/issues/new?${new URLSearchParams({ title: `题目反馈：${activeBank.name} ${q.id}`, body })}`;
+    el.reportDialog.showModal();
   }
 
   const EMPTY_LIST = [];
@@ -1302,10 +1473,10 @@
     const q = currentQ();
     const position = {
       mode: session.mode,
-      subject: session.subject,
-      chapterKey: session.chapterKey,
       index: session.index,
-      questionId: q ? String(q.id) : undefined,
+      ...(typeof session.subject === "string" ? { subject: session.subject } : {}),
+      ...(typeof session.chapterKey === "string" ? { chapterKey: session.chapterKey } : {}),
+      ...(q ? { questionId: String(q.id) } : {}),
     };
     saveState((latest) => {
       latest.last = position;
@@ -1378,9 +1549,9 @@
     notePreviewMode = false;
     const questionId = String(q.id);
     delete session.attempts[questionId];
-    delete session.drafts[questionId];
     saveState((latest) => {
       delete latest.done[questionId];
+      delete latest.drafts[questionId];
       // A wrong-book question stays in the book until a replacement answer is
       // submitted. Retrying a just-corrected item must therefore restore it.
       if (session.mode === "wrong" && !latest.wrong.includes(questionId)) {
@@ -1559,7 +1730,7 @@
         }
         showResult(q, answered);
       } else {
-        const draft = session.drafts[q.id] || "";
+        const draft = state.drafts[q.id] || "";
         const partIndex = Math.min(draft.length, partCount - 1);
         renderOptionGroup(q, partIndex, null);
       }
@@ -1598,6 +1769,7 @@
     prepareScrollableTables(el.options);
     typesetMath(el.stem);
     typesetMath(el.options);
+    syncRoute();
 
     const target =
       focusTarget === "option"
@@ -1688,12 +1860,25 @@
     textarea.rows = 8;
     textarea.maxLength = RESPONSE_MAX_LEN;
     textarea.placeholder = "写下解题步骤、关键结论或最终答案…";
-    textarea.value = session.drafts[q.id] || "";
+    textarea.value = state.drafts[q.id] || "";
     textarea.setAttribute("aria-label", "本题作答");
+    const draftStatus = document.createElement("p");
+    draftStatus.className = "draft-status";
+    draftStatus.setAttribute("role", "status");
+    draftStatus.textContent = textarea.value ? "已恢复作答草稿" : "作答草稿自动保存";
     textarea.addEventListener("input", () => {
-      session.drafts[q.id] = textarea.value.slice(0, RESPONSE_MAX_LEN);
+      const text = textarea.value.slice(0, RESPONSE_MAX_LEN);
+      draftStatus.textContent = "正在保存草稿…";
+      saveState((latest) => {
+        if (text) latest.drafts[q.id] = text;
+        else delete latest.drafts[q.id];
+      }).then((saved) => {
+        if (textarea.value !== text) return;
+        draftStatus.textContent = saved ? "草稿已保存" : "草稿未保存 · 请重试保存或导出备份";
+      });
     });
     wrapper.appendChild(textarea);
+    wrapper.appendChild(draftStatus);
 
     const actions = document.createElement("div");
     actions.className = "subjective-actions";
@@ -1720,9 +1905,9 @@
       ts: Date.now(),
     };
     if (session.mode === "wrong") session.attempts[q.id] = result;
-    delete session.drafts[q.id];
     saveState((latest) => {
       latest.done[String(q.id)] = result;
+      delete latest.drafts[String(q.id)];
     });
     renderQuestion("feedback");
   }
@@ -1844,13 +2029,13 @@
     if (answered) return;
 
     const partCount = getChoicePartCount(q);
-    const draft = session.drafts[q.id] || "";
+    const draft = state.drafts[q.id] || "";
     const expectedPart = Math.min(draft.length, partCount - 1);
     if (partIndex !== expectedPart) return;
 
     const choice = draft + letter;
     if (partIndex < partCount - 1) {
-      session.drafts[q.id] = choice;
+      saveState((latest) => { latest.drafts[String(q.id)] = choice; });
       renderQuestion("option");
       return;
     }
@@ -1866,11 +2051,11 @@
     const correct = correctnessForChoice(q, choice);
     const result = { choice, correct, ts: Date.now() };
     if (session.mode === "wrong") session.attempts[q.id] = result;
-    delete session.drafts[q.id];
 
     const questionId = String(q.id);
     saveState((latest) => {
       latest.done[questionId] = result;
+      delete latest.drafts[questionId];
       if (correct === false) {
         if (!latest.wrong.includes(questionId)) latest.wrong.push(questionId);
       } else if (correct === true) {
@@ -2004,32 +2189,26 @@
     const questionId = el.noteInput.dataset.questionId;
     if (!questionId) return;
     const text = el.noteInput.value.slice(0, NOTE_MAX_LEN);
-    pendingNote = { id: questionId, text };
     if (el.noteStatus) el.noteStatus.textContent = "保存中…";
-    clearTimeout(noteSaveTimer);
-    noteSaveTimer = setTimeout(() => {
-      flushNoteSave();
-    }, 350);
+    persistNote(questionId, text);
   }
 
   function flushNoteSave() {
-    clearTimeout(noteSaveTimer);
-    noteSaveTimer = null;
-    if (!pendingNote) return;
-    const { id, text } = pendingNote;
-    pendingNote = null;
-    persistNote(id, text);
+    if (activeStateStore?.pending && !activeStateStore.error) saveState();
   }
 
-  function persistNote(questionId, text) {
+  async function persistNote(questionId, text) {
+    const store = activeStateStore;
     const clipped = String(text || "").slice(0, NOTE_MAX_LEN);
-    const saved = saveState((latest) => {
+    unsavedNoteIds.add(questionId);
+    const saved = await saveState((latest) => {
       if (!clipped.trim()) {
         delete latest.notes[questionId];
       } else {
         latest.notes[questionId] = { text: clipped, updatedAt: Date.now() };
       }
     });
+    if (store !== activeStateStore) return saved;
     if (saved) unsavedNoteIds.delete(questionId);
     else unsavedNoteIds.add(questionId);
     if (el.noteInput && el.noteInput.dataset.questionId === String(questionId)) {
@@ -2038,6 +2217,7 @@
     if (el.btnNotes && !el.viewHome.classList.contains("hidden")) {
       el.btnNotes.disabled = notedQuestions().length === 0;
     }
+    return saved;
   }
 
   function toggleNoteEditor() {
@@ -2057,7 +2237,7 @@
     }
   }
 
-  function clearCurrentNote() {
+  async function clearCurrentNote() {
     const q = currentQ();
     if (!q || !el.noteInput) return;
     if (!el.noteInput.value.trim() && !hasNote(q.id)) {
@@ -2066,11 +2246,10 @@
     }
     if (!confirm("确定清空本题笔记？")) return;
     el.noteInput.value = "";
-    pendingNote = { id: String(q.id), text: "" };
-    flushNoteSave();
+    const saved = await persistNote(String(q.id), "");
     setNoteTab(notePreviewMode ? "preview" : "edit");
-    updateNoteStatus("");
-    toast("笔记已清空");
+    updateNoteStatus("", saved);
+    if (saved) toast("笔记已清空");
   }
 
   function explanationTextLength(source) {
@@ -2275,7 +2454,7 @@
       } else {
         title = "参考答案已就绪";
       }
-      detail = result.response ? "你的作答已保存" : "本次未填写作答";
+      detail = result.response ? "已提交本次作答" : "本次未填写作答";
     } else if (result.correct === null) {
       const choiceLabel = result.choice.split("").join(" / ");
       el.feedback.classList.add("neutral");
@@ -2396,9 +2575,9 @@
       latest.done = {};
       latest.wrong = [];
       latest.last = null;
-    });
+      latest.drafts = {};
+    }).then((saved) => { if (saved) toast("进度已清空（笔记已保留）"); });
     renderHome();
-    toast("进度已清空（笔记已保留）");
   }
 
   /* ---- lightweight markdown for stem/options/explanation ---- */
@@ -2803,38 +2982,32 @@
     el.btnNotePreviewTab.addEventListener("keydown", handleNoteTabKeydown);
   }
   window.addEventListener("pagehide", flushNoteSave);
-  window.addEventListener("storage", (event) => {
-    if (!activeBank || !STORAGE_KEY) return;
-    if (event.key !== STORAGE_KEY || storageWriteFailed || unsavedNoteIds.size) return;
-    // 错题本模式下避免列表与 state.wrong 脱节
-    if (session.mode === "wrong") return;
-    const visibleQuestion =
-      !el.viewQuiz.classList.contains("hidden") ? currentQ() : null;
-    const previousResult = visibleQuestion ? state.done[visibleQuestion.id] : null;
-    try {
-      state = event.newValue
-        ? normalizeStoredState(JSON.parse(event.newValue))
-        : emptyState();
-    } catch (_) {
-      showStorageWarning("其他标签页写入的进度无法读取，已保留当前页面状态");
-      return;
+  window.addEventListener("popstate", restoreRoute);
+  window.addEventListener("quizbackuprestored", () => {
+    for (const [bank, store] of stateStores) {
+      if (store.dispose()) stateStores.delete(bank);
     }
-    if (visibleQuestion) {
-      const nextResult = state.done[visibleQuestion.id];
-      const previousKey = previousResult
-        ? `${previousResult.choice}|${String(previousResult.correct)}|${previousResult.review || ""}`
-        : "";
-      const nextKey = nextResult
-        ? `${nextResult.choice}|${String(nextResult.correct)}|${nextResult.review || ""}`
-        : "";
-      if (previousKey !== nextKey) {
-        delete session.drafts[visibleQuestion.id];
-        renderQuestion(null, { rememberPosition: false });
-      }
-    }
+    activeStateStore = null;
+    activeBank = null;
+    data = null;
+    restoreRoute();
   });
 
   if (el.btnBanks) el.btnBanks.addEventListener("click", () => showBankChooser());
+  el.btnBackup.addEventListener("click", () => window.QuizBackup.open());
+  el.btnRetryLoad.addEventListener("click", () => selectBank(failedBankId));
+  el.btnResumeBank.addEventListener("click", async () => {
+    if (await selectBank(el.btnResumeBank.dataset.bank)) continueLast();
+  });
+  el.bankFilters.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-bank-filter]");
+    if (!button) return;
+    bankFilter = button.dataset.bankFilter;
+    for (const item of el.bankFilters.querySelectorAll("button")) item.setAttribute("aria-pressed", String(item === button));
+    renderBankChooser();
+  });
+  el.btnCopyLink.addEventListener("click", copyQuestionLink);
+  el.btnReport.addEventListener("click", reportQuestion);
   if (el.btnMethods) el.btnMethods.addEventListener("click", openMethodCenter);
   if (el.btnBackMethods) el.btnBackMethods.addEventListener("click", renderHome);
   if (el.btnAi) {
@@ -2862,7 +3035,7 @@
     });
   }
 
-  function startApp() {
+  async function startApp() {
     if (!banks.length) {
       showBankChooser();
       return;
@@ -2875,6 +3048,12 @@
     banks.forEach(runLegacyImport);
     renderBankChooser();
     updateTopbar();
+    if (location.hash) {
+      await restoreRoute();
+      return;
+    }
+    history.replaceState({ quizhub: true }, "", routeHash({ view: "banks" }));
+    restoringRoute = false;
     // 独立页面题库不自动恢复：否则上次刷过它，这里一打开就会被弹去那一页，回不到题库列表。
     const lastBank = lastBankId ? bankById(lastBankId) : null;
     if (lastBank && !isExternalBank(lastBank)) {

@@ -1,0 +1,28 @@
+#quiz-backup-dialog {
+  box-sizing: border-box; width: min(620px, calc(100vw - 24px)); max-height: 90dvh;
+  border: 1px solid #b9c3d0; border-radius: 18px; padding: 24px; color: #17283d;
+  background: #fff; font: 16px/1.65 system-ui, sans-serif; overflow: auto;
+}
+#quiz-backup-dialog::backdrop { background: #15233999; }
+#quiz-backup-dialog * { box-sizing: border-box; }
+#quiz-backup-dialog .backup-heading { display: flex; justify-content: space-between; gap: 14px; align-items: center; }
+#quiz-backup-dialog h2 { margin: 0; font-size: 1.3rem; }
+#quiz-backup-dialog h3 { margin: 0 0 12px; font-size: 1.05rem; }
+#quiz-backup-dialog section { padding: 18px 0; border-top: 1px solid #d9dfe7; }
+#quiz-backup-dialog section:empty { display: none; }
+#quiz-backup-dialog button { min-height: 44px; border: 1px solid #abb8cc; border-radius: 9px; background: #eef2ff; color: #283464; padding: 8px 14px; cursor: pointer; font: inherit; }
+#quiz-backup-dialog button:disabled { opacity: .5; cursor: default; }
+#quiz-backup-dialog input[type=file], #quiz-backup-dialog select { width: 100%; max-width: 100%; min-height: 44px; margin: 8px 0 16px; padding: 8px; border: 1px solid #abb8cc; border-radius: 8px; font: inherit; color: inherit; background: transparent; }
+#quiz-backup-dialog .backup-check { display: flex; align-items: flex-start; gap: 10px; margin: 12px 0; }
+#quiz-backup-dialog input[type=checkbox] { margin-top: 7px; flex: 0 0 auto; }
+#quiz-backup-dialog .backup-hint { font-size: .88rem; color: #50627b; }
+#quiz-backup-dialog #backup-status { overflow-wrap: anywhere; margin: 8px 0 0; }
+#quiz-backup-dialog #backup-status[data-error=true] { color: #aa2034; }
+#quiz-backup-dialog .backup-pending-row { padding: 12px; border: 1px solid #c1c9d6; border-radius: 8px; margin: 10px 0; }
+#quiz-backup-dialog .backup-pending-row button { margin: 4px; }
+#quiz-backup-dialog :focus-visible { outline: 3px solid #7461d9; outline-offset: 2px; }
+html[data-theme=dark] #quiz-backup-dialog { background: #182334; color: #e1e8f2; border-color: #59677c; }
+html[data-theme=dark] #quiz-backup-dialog .backup-hint { color: #b2bed0; }
+html[data-theme=dark] #quiz-backup-dialog button { background: #29385a; color: #eef1ff; }
+html[data-theme=dark] #quiz-backup-dialog #backup-status[data-error=true] { color: #ffacba; }
+@media(max-width:560px) { #quiz-backup-dialog { padding: 18px; } }

@@ -12,7 +12,6 @@ window.QuizAI = (function () {
   };
   // 默认留空：接口地址、Key、模型都在页面里填，不依赖任何本机脚本。
   const PRESET = {
-    version: 2,
     baseUrl: "",
     model: "",
     systemPrompt: "",
@@ -28,6 +27,14 @@ window.QuizAI = (function () {
   let settingsOpen = false;
   let activeRequest = null;
   let testRequest = null;
+  let modelRequest = null;
+  let settingsVersion = 0;
+  let settingsSnapshot = null;
+  let configReadError = '';
+  let threadReadError = '';
+  let modelCacheError = '';
+  let threadStore = null;
+  let unsubscribeThreads = null;
   let lastFocus = null;
   let lastSettingsFocus = null;
   let streamingFrame = 0;
@@ -45,6 +52,7 @@ window.QuizAI = (function () {
       apiKey: "",
       systemPrompt: PRESET.systemPrompt,
       rememberKey: PRESET.rememberKey,
+      timeoutMs: window.QuizAIClient.DEFAULT_TIMEOUT_MS,
     },
     threads: {},
     models: [],
@@ -52,163 +60,71 @@ window.QuizAI = (function () {
 
   /* ---------------- 存储 ---------------- */
 
-  function readJson(key, fallback) {
-    try {
-      const raw = localStorage.getItem(key);
-      if (!raw) return fallback;
-      const parsed = JSON.parse(raw);
-      return parsed && typeof parsed === "object" ? parsed : fallback;
-    } catch (_) {
-      return fallback;
-    }
-  }
-
-  function writeJson(key, value) {
-    try {
-      localStorage.setItem(key, JSON.stringify(value));
-      return true;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  function readText(store, key) {
-    try {
-      return store.getItem(key) || "";
-    } catch (_) {
-      return "";
-    }
-  }
-
-  function writeText(store, key, value) {
-    try {
-      if (value) store.setItem(key, value);
-      else store.removeItem(key);
-      return true;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  function snapshotStoredText(store, key) {
-    try {
-      return { store, key, value: store.getItem(key), readable: true };
-    } catch (_) {
-      return { store, key, value: null, readable: false };
-    }
-  }
-
-  function restoreStoredText(snapshot) {
-    try {
-      if (snapshot.value == null) snapshot.store.removeItem(snapshot.key);
-      else snapshot.store.setItem(snapshot.key, snapshot.value);
-      return true;
-    } catch (_) {
-      return false;
-    }
-  }
-
-  function persistSettings(next) {
-    const snapshots = [
-      snapshotStoredText(localStorage, KEY.systemPrompt),
-      snapshotStoredText(localStorage, KEY.config),
-      snapshotStoredText(localStorage, KEY.secret),
-      snapshotStoredText(sessionStorage, KEY.secret),
-    ];
-    if (snapshots.some((snapshot) => !snapshot.readable)) {
-      return { ok: false, failed: "storage" };
-    }
-
-    const operations = [
-      {
-        name: "systemPrompt",
-        write: () => writeText(localStorage, KEY.systemPrompt, next.systemPrompt),
-      },
-      {
-        name: "config",
-        write: () =>
-          writeJson(KEY.config, {
-            baseUrl: next.baseUrl,
-            model: next.model,
-            rememberKey: next.rememberKey,
-            presetVersion: PRESET.version,
-          }),
-      },
-      {
-        name: "localKey",
-        write: () => writeText(localStorage, KEY.secret, next.rememberKey ? next.apiKey : ""),
-      },
-      {
-        name: "sessionKey",
-        write: () => writeText(sessionStorage, KEY.secret, next.rememberKey ? "" : next.apiKey),
-      },
-    ];
-
-    for (const operation of operations) {
-      if (operation.write()) continue;
-      for (const snapshot of snapshots.slice().reverse()) restoreStoredText(snapshot);
-      return { ok: false, failed: operation.name };
-    }
-    return { ok: true, failed: "" };
+  function readJson(key, empty) {
+    const raw = localStorage.getItem(key);
+    if (raw === null) return empty;
+    let value;
+    try { value = JSON.parse(raw); }
+    catch (cause) { throw new Error('AI 模型记录无法读取，已保留原记录。', { cause }); }
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('AI 模型记录格式错误，已保留原记录。');
+    return value;
   }
 
   function loadConfig() {
-    const saved = readJson(KEY.config, {});
-    const baseUrl =
-      typeof saved.baseUrl === "string" && saved.baseUrl.trim() ? saved.baseUrl.trim() : PRESET.baseUrl;
-    const model = typeof saved.model === "string" && saved.model.trim() ? saved.model.trim() : PRESET.model;
-    const rememberKey = typeof saved.rememberKey === "boolean" ? saved.rememberKey : PRESET.rememberKey;
-    const apiKey = rememberKey
-      ? readText(localStorage, KEY.secret) || readText(sessionStorage, KEY.secret)
-      : readText(sessionStorage, KEY.secret);
-    const systemPrompt = readText(localStorage, KEY.systemPrompt);
-    state.config = { baseUrl, model, apiKey, systemPrompt, rememberKey };
-    state.models = recallModels(baseUrl);
-    writeJson(KEY.config, { baseUrl, model, rememberKey, presetVersion: PRESET.version });
-    // 防御：rememberKey=false 时清理 localStorage 残留
-    if (!rememberKey && readText(localStorage, KEY.secret)) {
-      writeText(localStorage, KEY.secret, "");
+    try {
+      state.config = window.QuizAIClient.settings.read();
+      configReadError = '';
+      state.models = recallModels(state.config.baseUrl);
+    } catch (error) {
+      configReadError = error.message;
+      showError(configReadError);
     }
+    syncSettingsRecovery();
   }
 
   function threadKey(questionId) {
     return `${state.bank ? state.bank.id : "unknown"}::${questionId}`;
   }
 
+  function normalizeThreads(raw) {
+    window.QuizRecordSchema.validate(raw, 'threads');
+    return raw;
+  }
+
   function loadThreads() {
-    const raw = readJson(KEY.threads, {});
-    const clean = {};
-    for (const [key, thread] of Object.entries(raw)) {
-      if (!thread || !Array.isArray(thread.messages)) continue;
-      const messages = thread.messages
-        .filter(
-          (message) =>
-            message &&
-            (message.role === "user" || message.role === "assistant") &&
-            typeof message.content === "string"
-        )
-        .map((message) => ({ role: message.role, content: message.content }));
-      if (!messages.length) continue;
-      clean[key] = { messages, updatedAt: Number(thread.updatedAt) || 0 };
-    }
-    state.threads = clean;
-  }
-
-  function persistThreads() {
-    // 不限制对话组数，保留所有题目的问答；仅按最近更新排序，写入失败时提示
-    const entries = Object.entries(state.threads).sort(
-      (a, b) => (b[1].updatedAt || 0) - (a[1].updatedAt || 0)
-    );
-    state.threads = Object.fromEntries(entries);
-    if (!writeJson(KEY.threads, state.threads)) {
-      showError("AI 对话无法保存到本机，请检查浏览器存储空间。");
+    try {
+      if (unsubscribeThreads) unsubscribeThreads();
+      threadStore = window.QuizStorage.open(KEY.threads, { empty: () => ({}), normalize: normalizeThreads, atomicPaths: ['*'] });
+      threadStore.refresh();
+      if (threadStore.error) throw threadStore.error;
+      state.threads = threadStore.value;
+      threadReadError = '';
+      unsubscribeThreads = threadStore.subscribe(event => {
+        state.threads = event.value;
+        if (event.type === 'error') showError(`AI 对话尚未保存：${event.error.message}`);
+        if (event.type === 'external' && panelOpen && !activeRequest) renderMessages();
+      });
+    } catch (error) {
+      threadReadError = `AI 对话无法读取，已停止写入以保留原记录。${error.message}`;
+      showError(threadReadError);
     }
   }
 
-  function threadFor(questionId, create) {
+  async function persistThread(key, thread) {
+    if (!threadStore || threadReadError) throw new Error(threadReadError || 'AI 对话存储尚未就绪。');
+    const saving = threadStore.update(latest => {
+      if (thread === null) delete latest[key];
+      else latest[key] = structuredClone(thread);
+    });
+    state.threads = threadStore.value;
+    await saving;
+    state.threads = threadStore.value;
+  }
+
+  function threadFor(questionId) {
     const key = threadKey(questionId);
-    if (!state.threads[key] && create) state.threads[key] = { messages: [], updatedAt: 0 };
-    return state.threads[key] || { messages: [], updatedAt: 0 };
+    const thread = state.threads[key];
+    return thread ? structuredClone(thread) : { messages: [], updatedAt: 0 };
   }
 
   function trimMessages(messages, maxMessages = MAX_MESSAGES, maxCharacters = MAX_CHARACTERS) {
@@ -404,7 +320,8 @@ window.QuizAI = (function () {
         wrapper.appendChild(table);
       }
       return template.innerHTML;
-    } catch (_) {
+    } catch (error) {
+      showError(`AI 排版失败，已显示原始文本：${error.message}`);
       return `<p>${host.escapeHtml(source).replace(/\n/g, "<br>")}</p>`;
     }
   }
@@ -469,7 +386,7 @@ window.QuizAI = (function () {
       dom.messages.innerHTML = '<div class="ai-empty">先在题目页打开 AI 讲解，才能带上题目上下文。</div>';
       return;
     }
-    const thread = threadFor(q.id, false);
+    const thread = threadFor(q.id);
     if (!thread.messages.length) {
       const configured = !!(state.config.baseUrl && state.config.model);
       const empty = document.createElement("div");
@@ -478,7 +395,7 @@ window.QuizAI = (function () {
         empty.innerHTML = `
           <p>还没有配置 AI 接口。点右上角「设置」，填服务商地址和 API Key，再获取模型列表选一个即可。</p>
           <ul>
-            <li>DeepSeek、硅基流动、OpenAI、智谱都能直接用，不用装任何东西</li>
+            <li>服务商需要允许浏览器跨域调用</li>
             <li>Key 只存在这台电脑的浏览器里</li>
           </ul>
         `;
@@ -543,6 +460,8 @@ window.QuizAI = (function () {
   }
 
   function clearError() {
+    const persistent = threadReadError || configReadError || modelCacheError;
+    if (persistent) { showError(persistent); return; }
     if (dom.error) {
       dom.error.textContent = "";
       dom.error.classList.add("hidden");
@@ -621,14 +540,18 @@ window.QuizAI = (function () {
 
   function openSettings() {
     if (!dom.settings) return;
+    cancelModelRequest();
     lastSettingsFocus = document.activeElement;
     settingsOpen = true;
+    try { settingsSnapshot = window.QuizAIClient.settings.snapshot(); }
+    catch (error) { configReadError = error.message; showError(error.message); }
     dom.settings.hidden = false;
     dom.baseUrl.value = state.config.baseUrl;
     dom.model.value = state.config.model;
     dom.apiKey.value = state.config.apiKey;
     dom.systemPrompt.value = state.config.systemPrompt;
     dom.rememberKey.checked = state.config.rememberKey;
+    dom.timeout.value = String(state.config.timeoutMs / 1000);
     setKeyVisible(false);
     if (dom.modelFilter) {
       dom.modelFilter.value = "";
@@ -636,6 +559,7 @@ window.QuizAI = (function () {
     }
     renderModelOptions(state.models);
     setSettingsStatus("", "");
+    syncSettingsRecovery();
     (state.config.baseUrl ? dom.apiKey : dom.baseUrl).focus();
   }
 
@@ -644,6 +568,36 @@ window.QuizAI = (function () {
     dom.apiKey.type = visible ? "text" : "password";
     dom.btnKeyVisible.textContent = visible ? "隐藏" : "显示";
     dom.btnKeyVisible.setAttribute("aria-pressed", String(visible));
+  }
+
+  function syncSettingsRecovery() {
+    if (!dom.settingsRecovery) return;
+    dom.settingsRecovery.hidden = !configReadError;
+    dom.settingsRecovery.querySelector('p').textContent = configReadError ? `${configReadError} 原文导出文件可能含私人配置，请妥善保存；API Key 存储项不会导出。` : '';
+  }
+
+  function downloadDamagedSettings() {
+    try {
+      const payload = window.QuizAIClient.settings.recovery.export();
+      const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json;charset=utf-8' }));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `AI私密配置原文-${new Date().toISOString().slice(0, 10)}.json`;
+      link.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setSettingsStatus('损坏设置原文已导出，请将私密配置文件保存在安全位置。', 'ok');
+    } catch (error) { setSettingsStatus(`设置原文未导出：${error.message}`, 'bad'); }
+  }
+
+  async function resetDamagedSettings() {
+    if (!confirm('确定重新配置损坏的 AI 设置？请先导出损坏设置原文。已保存的 API Key 和系统提示词会保留。')) return;
+    try {
+      state.config = await window.QuizAIClient.settings.recovery.reset(settingsSnapshot);
+      configReadError = '';
+      openSettings();
+      clearError();
+      setSettingsStatus('已恢复有效设置，请重新填写服务商地址和模型。', 'ok');
+    } catch (error) { setSettingsStatus(`未能重新配置：${error.message}`, 'bad'); }
   }
 
   /** 把模型列表填进下拉框；列表多时露出筛选框 */
@@ -686,122 +640,82 @@ window.QuizAI = (function () {
     }
   }
 
-  function modelsEndpoints(rawBaseUrl) {
-    const base = normalizeBaseUrl(rawBaseUrl);
-    const candidates = [`${base}/models`];
-    // 有人只填到域名，这里顺带试一次标准的 /v1
-    if (!/\/v\d+(?:$|\/)/.test(new URL(base).pathname)) candidates.push(`${base}/v1/models`);
-    return candidates;
-  }
-
-  function pickModelIds(payload) {
-    const rows = Array.isArray(payload)
-      ? payload
-      : Array.isArray(payload && payload.data)
-        ? payload.data
-        : Array.isArray(payload && payload.models)
-          ? payload.models
-          : [];
-    const ids = rows
-      .map((row) => (typeof row === "string" ? row : row && (row.id || row.name || row.model)))
-      .filter((id) => typeof id === "string" && id.trim())
-      .map((id) => id.trim());
-    return [...new Set(ids)].sort((a, b) => a.localeCompare(b));
+  function cancelModelRequest() {
+    settingsVersion += 1;
+    if (modelRequest) modelRequest.abort();
+    modelRequest = null;
+    if (dom.btnModels) {
+      dom.btnModels.disabled = false;
+      dom.btnModels.textContent = '获取模型';
+    }
   }
 
   async function fetchModels() {
+    if (modelRequest) {
+      cancelModelRequest();
+      setSettingsStatus('已停止获取模型。', '');
+      return;
+    }
     const config = readSettingsForm();
-    if (!config.baseUrl) {
-      setSettingsStatus("先填服务商地址。", "bad");
-      dom.baseUrl.focus();
-      return;
-    }
-    let endpoints;
+    const version = ++settingsVersion;
+    const controller = new AbortController();
+    modelRequest = controller;
+    dom.btnModels.textContent = '停止获取';
+    setSettingsStatus('正在获取模型列表…', '');
     try {
-      endpoints = modelsEndpoints(config.baseUrl);
+      const result = await window.QuizAIClient.discoverModels(config.baseUrl, config.apiKey, { signal: controller.signal, timeoutMs: config.timeoutMs });
+      if (!settingsOpen || settingsVersion !== version || readSettingsForm().baseUrl !== config.baseUrl || readSettingsForm().apiKey !== config.apiKey) return;
+      dom.baseUrl.value = result.baseUrl;
+      state.models = result.models;
+      await rememberModels(result.baseUrl, result.models);
+      if (!settingsOpen || settingsVersion !== version || dom.baseUrl.value !== result.baseUrl) return;
+      if (dom.modelFilter) dom.modelFilter.value = '';
+      renderModelOptions(result.models);
+      if (!dom.model.value.trim()) {
+        dom.model.value = result.models[0];
+        dom.modelPicker.value = result.models[0];
+      }
+      setSettingsStatus(`拿到 ${result.models.length} 个模型；API 地址已确认，选一个再保存。${modelCacheError}`, modelCacheError ? 'bad' : 'ok');
+      dom.modelPicker.focus();
     } catch (error) {
-      setSettingsStatus(error.message, "bad");
-      return;
-    }
-
-    dom.btnModels.disabled = true;
-    setSettingsStatus("正在获取模型列表…", "");
-    let lastError = null;
-    let unreachable = false;
-    try {
-      for (const endpoint of endpoints) {
-        let response;
-        try {
-          response = await fetch(endpoint, {
-            method: "GET",
-            mode: "cors",
-            credentials: "omit",
-            cache: "no-store",
-            headers: Object.assign(
-              { Accept: "application/json" },
-              config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {}
-            ),
-          });
-        } catch (error) {
-          unreachable = true;
-          continue;
-        }
-        if (!response.ok) {
-          lastError = await createHttpError(response, 1, 1);
-          continue;
-        }
-        let payload;
-        try {
-          payload = await response.json();
-        } catch (_) {
-          lastError = new Error("这个地址返回的不是 JSON，确认一下是不是 API 地址（通常以 /v1 结尾）。");
-          continue;
-        }
-        const models = pickModelIds(payload);
-        if (!models.length) {
-          lastError = new Error("接口通了，但没返回任何模型。可以直接在下面手填模型名。");
-          continue;
-        }
-        state.models = models;
-        rememberModels(config.baseUrl, models);
-        if (dom.modelFilter) dom.modelFilter.value = "";
-        renderModelOptions(models);
-        if (!dom.model.value.trim()) {
-          dom.model.value = models[0];
-          dom.modelPicker.value = models[0];
-        }
-        setSettingsStatus(`拿到 ${models.length} 个模型，选一个再保存。`, "ok");
-        dom.modelPicker.focus();
-        return;
-      }
-      if (unreachable) {
-        setSettingsStatus("正在判断是连不上还是不允许网页调用…", "");
-        setSettingsStatus(await directAccessErrorMessage(config.baseUrl), "bad");
-        return;
-      }
-      setSettingsStatus(lastError ? lastError.message : "没能获取模型列表。", "bad");
+      if (settingsVersion !== version || !settingsOpen) return;
+      setSettingsStatus(error.name === 'AbortError' ? '已停止获取模型。' : error.message, error.name === 'AbortError' ? '' : 'bad');
     } finally {
-      dom.btnModels.disabled = false;
+      if (modelRequest === controller) {
+        modelRequest = null;
+        dom.btnModels.textContent = '获取模型';
+      }
     }
   }
 
-  /** 记住每家服务商的模型列表，换回来时不用重新获取 */
-  function rememberModels(baseUrl, models) {
-    const cache = readJson(KEY.models, {});
-    cache[normalizeQuietly(baseUrl)] = { models, ts: Date.now() };
-    const entries = Object.entries(cache).sort((a, b) => (b[1].ts || 0) - (a[1].ts || 0));
-    writeJson(KEY.models, Object.fromEntries(entries.slice(0, 8)));
+  async function rememberModels(baseUrl, models) {
+    try {
+      const previous = localStorage.getItem(KEY.models);
+      const cache = readJson(KEY.models, {});
+      cache[normalizeQuietly(baseUrl)] = { models, ts: Date.now() };
+      await window.QuizStorage.transaction([{ key: KEY.models, expectedRaw: previous, value: cache }]);
+      modelCacheError = '';
+    } catch (error) {
+      modelCacheError = `模型列表未缓存：${error.message}`;
+    }
   }
 
   function recallModels(baseUrl) {
     if (!baseUrl) return [];
-    const entry = readJson(KEY.models, {})[normalizeQuietly(baseUrl)];
-    return entry && Array.isArray(entry.models) ? entry.models : [];
+    try {
+      const entry = readJson(KEY.models, {})[normalizeQuietly(baseUrl)];
+      return entry && Array.isArray(entry.models) ? entry.models : [];
+    } catch (error) {
+      modelCacheError = error.message;
+      showError(modelCacheError);
+      return [];
+    }
   }
 
   function closeSettings(restoreFocus) {
     if (!dom.settings || !settingsOpen) return;
     settingsOpen = false;
+    cancelModelRequest();
     dom.settings.hidden = true;
     if (testRequest) {
       testRequest.abort();
@@ -835,10 +749,11 @@ window.QuizAI = (function () {
       apiKey: String(dom.apiKey.value || "").trim(),
       systemPrompt: String(dom.systemPrompt.value || ""),
       rememberKey: !!dom.rememberKey.checked,
+      timeoutMs: dom.timeout.value.trim() ? Number(dom.timeout.value) * 1000 : NaN,
     };
   }
 
-  function saveSettings(event) {
+  async function saveSettings(event) {
     if (event) event.preventDefault();
     const next = readSettingsForm();
 
@@ -864,16 +779,13 @@ window.QuizAI = (function () {
       }
     }
 
-    const saved = persistSettings(next);
-    if (!saved.ok) {
-      if (saved.failed === "systemPrompt") {
-        setSettingsStatus("浏览器存储空间不足，系统提示词未保存。", "bad");
-        dom.systemPrompt.focus();
-        return;
-      }
-      setSettingsStatus("浏览器存储失败，AI 设置未完整保存。", "bad");
+    try {
+      await window.QuizAIClient.settings.save(next, settingsSnapshot);
+    } catch (error) {
+      setSettingsStatus(`AI 设置未保存：${error.message}`, 'bad');
       return;
     }
+    configReadError = '';
     state.config = next;
     setSettingsStatus("已保存。", "ok");
     clearError();
@@ -903,10 +815,10 @@ window.QuizAI = (function () {
         ],
         { stream: false, signal: controller.signal, maxAttempts: 1, quietRetry: true }
       );
-      setSettingsStatus(`「${config.model}」可以正常对话，记得点保存。`, "ok");
+      if (testRequest === controller && settingsOpen && readSettingsForm().baseUrl === config.baseUrl && readSettingsForm().model === config.model) setSettingsStatus(`「${config.model}」可以正常对话，记得点保存。`, 'ok');
     } catch (error) {
       if (error.name === "AbortError") return;
-      setSettingsStatus(friendlyError(error), "bad");
+      if (testRequest === controller && settingsOpen) setSettingsStatus(friendlyError(error), "bad");
     } finally {
       if (testRequest === controller) testRequest = null;
     }
@@ -914,260 +826,12 @@ window.QuizAI = (function () {
 
   /* ---------------- 请求 ---------------- */
 
-  /** 校验并整理服务商地址，返回不带尾斜杠的基地址 */
-  function normalizeBaseUrl(raw) {
-    const text = String(raw || "").trim();
-    if (!text) throw new Error("请先填服务商地址。");
-    let url;
-    try {
-      url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : `https://${text}`);
-    } catch (_) {
-      throw new Error("服务商地址格式不对，应该像 https://api.deepseek.com/v1。");
-    }
-    if (url.protocol !== "https:" && url.protocol !== "http:") {
-      throw new Error("服务商地址只支持 http 或 https。");
-    }
-    if (url.username || url.password) throw new Error("服务商地址不能带用户名或密码。");
-    const loopback = ["localhost", "127.0.0.1", "::1"].includes(url.hostname.toLowerCase());
-    if (url.protocol === "http:" && !loopback) {
-      throw new Error("远程接口必须用 HTTPS；HTTP 只允许本机地址（127.0.0.1 / localhost）。");
-    }
-    url.hash = "";
-    url.search = "";
-    url.pathname = url.pathname.replace(/\/+$/, "");
-    return url.toString().replace(/\/+$/, "");
-  }
-
-  function normalizeEndpoint(raw) {
-    const base = normalizeBaseUrl(raw);
-    return base.endsWith("/chat/completions") ? base : `${base}/chat/completions`;
-  }
-
-  function sleepWithSignal(ms, signal) {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(resolve, ms);
-      if (!signal) return;
-      signal.addEventListener(
-        "abort",
-        () => {
-          clearTimeout(timer);
-          const error = new Error("已取消");
-          error.name = "AbortError";
-          reject(error);
-        },
-        { once: true }
-      );
-    });
-  }
-
-  function extractContent(value) {
-    if (typeof value === "string") return value;
-    if (Array.isArray(value)) {
-      return value
-        .map((part) => (typeof part === "string" ? part : part && part.text ? part.text : ""))
-        .join("");
-    }
-    return "";
-  }
-
-  async function readEventStream(response, onDelta) {
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder("utf-8");
-    let buffer = "";
-    let answer = "";
-    // SSE 规范：一个事件可以有多个 data: 行，要先拼接再解析。
-    const consumeEvent = (eventText) => {
-      const dataLines = [];
-      for (const line of eventText.split(/\r\n|\n|\r/)) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith("data:")) continue;
-        dataLines.push(trimmed.slice(5).trim());
-      }
-      if (!dataLines.length) return;
-      const payloadText = dataLines.join("\n").trim();
-      if (!payloadText || payloadText === "[DONE]") return;
-      let payload;
-      try {
-        payload = JSON.parse(payloadText);
-      } catch (_) {
-        return;
-      }
-      const delta = payload && payload.choices && payload.choices[0];
-      const piece = delta
-        ? extractContent(delta.delta && delta.delta.content) ||
-          extractContent(delta.message && delta.message.content)
-        : "";
-      if (piece) {
-        answer += piece;
-        if (onDelta) onDelta(answer);
-      }
-    };
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const chunks = buffer.split(/\r\n\r\n|\n\n|\r\r/);
-      buffer = chunks.pop() || "";
-      for (const chunk of chunks) consumeEvent(chunk);
-    }
-    buffer += decoder.decode();
-    if (buffer.trim()) consumeEvent(buffer);
-    if (!answer) throw new Error("接口返回成功，但没有可显示的回答。");
-    return answer;
-  }
-
-  async function createHttpError(response, attempt, maxAttempts) {
-    let detail = "";
-    try {
-      const text = await response.text();
-      if (text) {
-        try {
-          const payload = JSON.parse(text);
-          detail =
-            typeof payload.error === "string"
-              ? payload.error
-              : (payload.error && payload.error.message) || payload.message || "";
-        } catch (_) {
-          detail = text;
-        }
-      }
-    } catch (_) {}
-    detail = String(detail).replace(/\s+/g, " ").trim().slice(0, 320);
-    const suffix = detail ? `：${detail}` : "";
-    if ([502, 503, 504].includes(response.status)) {
-      return new Error(
-        `上游模型服务暂时不可用（HTTP ${response.status}${suffix}）。这是服务商侧的问题，不是本地配置错误；已自动重试 ${attempt}/${maxAttempts} 次，请过几分钟再试。`
-      );
-    }
-    if (response.status === 429) return new Error(`请求太频繁（HTTP 429${suffix}），稍后再试。`);
-    if (response.status === 401 || response.status === 403) {
-      return new Error(`鉴权失败（HTTP ${response.status}${suffix}）。请检查 API Key 或本机代理配置。`);
-    }
-    return new Error(`接口返回 HTTP ${response.status}${suffix}`);
-  }
-
-  /**
-   * fetch 抛错时浏览器不会告诉我们究竟是断网还是被跨域拦下，
-   * 所以这里把两种可能都说清楚，并给出能自己判断的办法。
-   */
-  function hostOf(baseUrl) {
-    try {
-      return new URL(normalizeBaseUrl(baseUrl)).host;
-    } catch (_) {
-      return String(baseUrl || "").trim();
-    }
-  }
-
-  /**
-   * fetch 抛错时浏览器不会说清是断网还是被跨域拦下。
-   * no-cors 请求不受跨域限制，只在真正连不上时才失败——
-   * 用它就能把「站活着但不放行网页」和「压根连不上」区分开。
-   */
-  async function diagnoseDirectAccess(baseUrl) {
-    let probeUrl;
-    try {
-      probeUrl = `${normalizeBaseUrl(baseUrl)}/models`;
-    } catch (_) {
-      return "address";
-    }
-    try {
-      await fetch(probeUrl, { mode: "no-cors", credentials: "omit", cache: "no-store" });
-      return "cors";
-    } catch (_) {
-      return "network";
-    }
-  }
-
-  async function directAccessErrorMessage(baseUrl) {
-    const host_ = hostOf(baseUrl);
-    const kind = await diagnoseDirectAccess(baseUrl);
-    if (kind === "cors") {
-      return (
-        `${host_} 能连上，但它不允许网页直接调用（没开跨域）。这家中转站用不了，` +
-        `换一个开了跨域的站点或官方接口即可——DeepSeek、硅基流动、OpenAI、智谱实测都可以直连。`
-      );
-    }
-    if (kind === "address") {
-      return "地址格式不对，应该像 https://api.deepseek.com/v1。";
-    }
-    return (
-      `连不上 ${host_}。检查一下地址有没有写错（正确形式像 https://中转站域名/v1），` +
-      `以及这个站点现在是否可以正常访问。`
-    );
-  }
-
-
-  async function requestCompletion(config, messages, options) {
-    const opts = options || {};
-    const stream = opts.stream !== false;
-    const endpoint = normalizeEndpoint(config.baseUrl);
-    const maxAttempts = opts.maxAttempts || 3;
-    let lastError = null;
-
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      let response;
-      try {
-        response = await fetch(endpoint, {
-          method: "POST",
-          mode: "cors",
-          credentials: "omit",
-          cache: "no-store",
-          headers: Object.assign(
-            {
-              "Content-Type": "application/json",
-              Accept: stream ? "text/event-stream" : "application/json",
-            },
-            config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {}
-          ),
-          body: JSON.stringify({ model: config.model, messages, stream }),
-          signal: opts.signal,
-        });
-      } catch (error) {
-        if (error.name === "AbortError") throw error;
-        throw new Error(await directAccessErrorMessage(config.baseUrl));
-      }
-
-      if (!response.ok) {
-        const httpError = await createHttpError(response, attempt, maxAttempts);
-        const retryable = [429, 502, 503, 504].includes(response.status);
-        if (retryable && attempt < maxAttempts) {
-          lastError = httpError;
-          if (!opts.quietRetry) {
-            setStatus(`上游繁忙（HTTP ${response.status}），第 ${attempt + 1}/${maxAttempts} 次重试…`);
-          }
-          await sleepWithSignal(900 * attempt, opts.signal);
-          continue;
-        }
-        throw httpError;
-      }
-
-      const contentType = (response.headers.get("content-type") || "").toLowerCase();
-      if (stream && response.body && contentType.includes("text/event-stream")) {
-        return readEventStream(response, opts.onDelta);
-      }
-
-      let payload;
-      try {
-        payload = await response.json();
-      } catch (_) {
-        throw new Error("接口返回的内容不是有效 JSON。");
-      }
-      if (payload && payload.error) {
-        throw new Error(
-          typeof payload.error === "string" ? payload.error : payload.error.message || "接口返回错误。"
-        );
-      }
-      const choice = payload && payload.choices && payload.choices[0];
-      const content = choice
-        ? extractContent(choice.message && choice.message.content) ||
-          extractContent(choice.delta && choice.delta.content)
-        : "";
-      if (!content) throw new Error("接口返回成功，但没有可显示的回答。");
-      if (opts.onDelta) opts.onDelta(content);
-      return content;
-    }
-    throw lastError || new Error("AI 请求失败，请稍后重试。");
-  }
+  const normalizeBaseUrl = raw => window.QuizAIClient.normalizeBaseUrl(raw);
+  const requestCompletion = (config, messages, options = {}) => window.QuizAIClient.requestCompletion(config, messages, {
+    ...options,
+    timeoutMs: options.timeoutMs === undefined ? config.timeoutMs : options.timeoutMs,
+    onStatus: options.quietRetry ? undefined : setStatus,
+  });
 
   function friendlyError(error) {
     if (!error) return "AI 请求失败。";
@@ -1183,6 +847,7 @@ window.QuizAI = (function () {
     }
     const q = state.question;
     if (!q) return;
+    if (threadReadError || configReadError) { showError(threadReadError || configReadError); return; }
     const text = String(suggested || (dom.input ? dom.input.value : "")).trim();
     if (!text) return;
     if (!state.config.baseUrl || !state.config.model) {
@@ -1194,28 +859,35 @@ window.QuizAI = (function () {
     clearError();
     const questionId = q.id;
     const key = threadKey(questionId);
-    const thread = threadFor(questionId, true);
+    const thread = threadFor(questionId);
+    const request = {
+      controller: new AbortController(), questionId, threadKey: key,
+      reason: '', answer: '', contentNode: null,
+    };
+    activeRequest = request;
+    setBusy(true);
     thread.messages.push({ role: "user", content: text });
     thread.messages = trimMessages(thread.messages);
     thread.updatedAt = Date.now();
-    state.threads[key] = thread;
-    persistThreads();
+    try {
+      await persistThread(key, thread);
+    } catch (error) {
+      showError(`问题尚未保存，未发送请求：${error.message}`);
+      if (activeRequest === request) activeRequest = null;
+      setBusy(false);
+      return;
+    }
+    if (request.controller.signal.aborted || request.reason === 'switch') {
+      if (activeRequest === request) activeRequest = null;
+      setBusy(false);
+      return;
+    }
     if (dom.input) {
       dom.input.value = "";
       resizeInput();
     }
     renderMessages();
 
-    const request = {
-      controller: new AbortController(),
-      questionId,
-      threadKey: key,
-      reason: "",
-      answer: "",
-      contentNode: null,
-    };
-    activeRequest = request;
-    attachActiveRequestNode(request);
     scrollMessages();
     setBusy(true);
     try {
@@ -1236,17 +908,19 @@ window.QuizAI = (function () {
       if (error.name === "AbortError") {
         if (request.answer) request.answer += "\n\n_回答已停止。_";
       } else {
+        if (error.partialAnswer && !request.answer) request.answer = error.partialAnswer;
+        if (request.answer) request.answer += `\n\n_回答未完成：${friendlyError(error)}_`;
         showError(friendlyError(error));
       }
     } finally {
       cancelStreamingRender();
       if (request.answer && request.reason !== "clear" && request.reason !== "switch") {
-        const target = state.threads[request.threadKey] || { messages: [], updatedAt: 0 };
+        const target = structuredClone(state.threads[request.threadKey] || { messages: [], updatedAt: 0 });
         target.messages.push({ role: "assistant", content: request.answer });
         target.messages = trimMessages(target.messages, 20, 24000);
         target.updatedAt = Date.now();
-        state.threads[request.threadKey] = target;
-        persistThreads();
+        try { await persistThread(request.threadKey, target); }
+        catch (error) { showError(`AI 回答尚未保存：${error.message}`); }
       }
       if (activeRequest === request) activeRequest = null;
       if (state.question && state.question.id === questionId) renderMessages();
@@ -1254,7 +928,7 @@ window.QuizAI = (function () {
     }
   }
 
-  function clearThread() {
+  async function clearThread() {
     const q = state.question;
     if (!q) return;
     cancelStreamingRender();
@@ -1262,10 +936,11 @@ window.QuizAI = (function () {
       activeRequest.reason = "clear";
       activeRequest.controller.abort();
     }
-    delete state.threads[threadKey(q.id)];
-    persistThreads();
-    renderMessages();
-    host.toast("已清空本题对话");
+    try {
+      await persistThread(threadKey(q.id), null);
+      renderMessages();
+      host.toast('已清空本题对话');
+    } catch (error) { showError(`对话未清空：${error.message}`); }
   }
 
   function resizeInput() {
@@ -1304,6 +979,18 @@ window.QuizAI = (function () {
     dom.rememberKey = document.getElementById("ai-remember-key");
     if (!dom.panel || !dom.messages || !dom.input) return;
 
+    const timeoutField = document.createElement('div');
+    timeoutField.className = 'ai-field';
+    timeoutField.innerHTML = '<label for="ai-timeout">请求超时（秒）</label><input id="ai-timeout" type="number" min="0" step="1" value="120"><span class="ai-field-hint">0 表示关闭超时；达到时限会停止请求并保留未完成内容。</span>';
+    dom.rememberKey.closest('label').before(timeoutField);
+    dom.timeout = timeoutField.querySelector('input');
+    dom.settingsRecovery = document.createElement('section');
+    dom.settingsRecovery.className = 'ai-field';
+    dom.settingsRecovery.hidden = true;
+    dom.settingsRecovery.innerHTML = '<p></p><div><button type="button" class="btn" id="btn-ai-export-damaged">导出损坏设置原文</button> <button type="button" class="btn" id="btn-ai-reset-damaged">重新配置</button></div>';
+    dom.settingsForm.querySelector('h3').after(dom.settingsRecovery);
+    dom.settingsRecovery.querySelector('#btn-ai-export-damaged').addEventListener('click', downloadDamagedSettings);
+    dom.settingsRecovery.querySelector('#btn-ai-reset-damaged').addEventListener('click', resetDamagedSettings);
     loadConfig();
     loadThreads();
 
@@ -1333,6 +1020,17 @@ window.QuizAI = (function () {
     // 换服务商时切换到那家的模型列表；没存过就清空。
     // 提示只写模型行的 hint，不碰 #ai-settings-status——
     // 那里是「获取 / 测试 / 保存」的结果区，被这里覆盖会盖掉校验报错。
+    dom.baseUrl.addEventListener('input', () => {
+      cancelModelRequest();
+      if (testRequest) { testRequest.abort(); testRequest = null; }
+      dom.model.value = '';
+      state.models = [];
+      renderModelOptions([]);
+    });
+    dom.apiKey.addEventListener('input', () => {
+      cancelModelRequest();
+      if (testRequest) { testRequest.abort(); testRequest = null; }
+    });
     dom.baseUrl.addEventListener("change", () => {
       const next = normalizeQuietly(dom.baseUrl.value);
       if (next === normalizeQuietly(state.config.baseUrl) && state.models.length) return;
@@ -1360,6 +1058,16 @@ window.QuizAI = (function () {
         event.preventDefault();
         send();
       }
+    });
+    window.addEventListener('quiz-ai-settings-changed', () => { if (!settingsOpen) { loadConfig(); setBusy(!!activeRequest); } });
+    window.addEventListener('quizbackuprestored', event => {
+      if (!event.detail.keys.includes(KEY.threads)) return;
+      loadThreads();
+      clearError();
+      if (panelOpen) renderMessages();
+    });
+    window.addEventListener('storage', event => {
+      if ([KEY.config, KEY.secret, KEY.systemPrompt].includes(event.key) && !settingsOpen) { loadConfig(); setBusy(!!activeRequest); }
     });
     ready = true;
     setBusy(false);

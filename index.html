@@ -68,6 +68,7 @@
           <button type="button" class="btn btn-ghost" id="btn-theme" aria-pressed="false">
             ☾ 暗色
           </button>
+          <button type="button" class="btn btn-ghost" id="btn-backup">备份与恢复</button>
           <button type="button" class="btn btn-ghost hidden" id="btn-reset" title="清空当前题库的本地进度">
             清空进度
           </button>
@@ -90,10 +91,23 @@
             <h2 id="banks-title" tabindex="-1">全部题库</h2>
             <span class="page-title-note" id="banks-note"></span>
           </div>
+          <div class="welcome-guide">
+            <p><strong>选一套题库，随时开始。</strong>无需登录，进度、草稿和笔记保存在当前浏览器。换设备或清理浏览器前，请先备份记录。</p>
+            <button type="button" class="btn btn-primary" id="btn-resume-bank" hidden>继续上次</button>
+          </div>
           <p class="bank-tip star-request">
             如果刷题中心帮到了你，欢迎在
             <a href="https://github.com/Hokkaidoooo/quiz-hub" target="_blank" rel="noopener noreferrer">GitHub 点个 Star ⭐</a>。
           </p>
+          <div class="bank-filters" id="bank-filters" role="group" aria-label="按学科选择题库">
+            <button type="button" class="btn" data-bank-filter="all" aria-pressed="true">全部</button>
+            <button type="button" class="btn" data-bank-filter="computer" aria-pressed="false">计算机 408</button>
+            <button type="button" class="btn" data-bank-filter="math" aria-pressed="false">考研数学</button>
+          </div>
+          <div class="bank-load-error" id="bank-load-error" hidden role="status">
+            <span>题库未能载入，可以重试或选择其他题库。</span>
+            <button type="button" class="btn" id="btn-retry-load">重试载入</button>
+          </div>
           <div class="bank-grid" id="bank-grid"></div>
           <p class="bank-tip">
             进度和笔记自动保存在当前浏览器，每个题库单独记录。
@@ -173,6 +187,10 @@
               <div class="quiz-progress-text" id="quiz-progress-text"></div>
             </div>
             <div class="quiz-source hidden" id="quiz-source"></div>
+            <div class="question-links">
+              <button type="button" class="btn btn-ghost" id="btn-copy-link">复制题目链接</button>
+              <button type="button" class="btn btn-ghost" id="btn-report">题目纠错</button>
+            </div>
           </div>
 
           <div class="card quiz-card">
@@ -454,12 +472,34 @@
 
     <div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
+    <dialog class="utility-dialog" id="share-dialog" aria-labelledby="share-title">
+      <h2 id="share-title">题目链接</h2>
+      <p>浏览器未允许自动复制，请选中下方链接后复制。</p>
+      <label class="visually-hidden" for="share-url">题目链接</label>
+      <input id="share-url" type="text" readonly />
+      <form method="dialog"><button class="btn" type="submit">关闭</button></form>
+    </dialog>
+    <dialog class="utility-dialog" id="report-dialog" aria-labelledby="report-title">
+      <h2 id="report-title">题目纠错</h2>
+      <p>反馈会带上题库、题号和链接。请在 GitHub 页面填写问题描述与依据后提交。</p>
+      <label for="report-preview">将带入反馈的内容</label>
+      <textarea id="report-preview" rows="8" readonly></textarea>
+      <div class="utility-dialog-actions">
+        <form method="dialog"><button class="btn" type="submit">取消</button></form>
+        <a class="btn btn-primary" id="report-link" target="_blank" rel="noopener noreferrer">前往 GitHub 填写反馈</a>
+      </div>
+    </dialog>
+
     <script src="banks.js"></script>
     <script defer src="vendor/katex/katex.min.js"></script>
     <script defer src="vendor/katex/contrib/auto-render.min.js"></script>
     <script defer src="vendor/marked/marked.umd.js"></script>
     <script defer src="vendor/dompurify/purify.min.js"></script>
+    <script defer src="record-schema.js"></script>
+    <script defer src="storage.js"></script>
+    <script defer src="ai-client.js"></script>
     <script defer src="ai.js"></script>
+    <script defer src="backup.js"></script>
     <script defer src="app.js"></script>
   </body>
 </html>
