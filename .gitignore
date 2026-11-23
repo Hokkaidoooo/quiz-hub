@@ -1,0 +1,9 @@
+STATUS.md
+AGENTS.md
+tools/
+node_modules/
+*.log
+*.zip
+*.pdf
+.env*
+*.local.*
